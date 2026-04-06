@@ -15,8 +15,8 @@ load_dotenv()
 MODEL_PATH = os.getenv("MODEL_PATH")
 CONFIDENCE = float(os.getenv("CONFIDENCE", 0.25))
 
-TCP_PORT = int(os.getenv("VIDEO_TCP_PORT", 5005))
-LIDAR_PORT = int(os.getenv("LIDAR_UDP_PORT", 6006))
+VIDEO_PORT = int(os.getenv("VIDEO_TCP_PORT", 5005))   # TCP
+LIDAR_PORT = int(os.getenv("LIDAR_UDP_PORT", 6006))   # UDP
 
 W = int(os.getenv("FRAME_WIDTH", 640))
 H = int(os.getenv("FRAME_HEIGHT", 480))
@@ -29,7 +29,7 @@ WINDOW_NAME = os.getenv("WINDOW_CAMERA", "Unity TCP Stream")
 # ============== MODEL ==============
 model = YOLO(MODEL_PATH)
 
-# ============== QUEUES ==============
+# ============== QUEUES / STATE ==============
 frame_queue = Queue(maxsize=2)
 lidar_data = {}
 
@@ -37,7 +37,8 @@ lidar_data = {}
 class KalmanTracker:
     def __init__(self, x, y):
         self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.measurementMatrix = np.array([[1,0,0,0],
+                                              [0,1,0,0]], np.float32)
         self.kf.transitionMatrix = np.array([[1,0,1,0],
                                              [0,1,0,1],
                                              [0,0,1,0],
@@ -55,76 +56,98 @@ class KalmanTracker:
 
     def predict(self):
         prediction = self.kf.predict()
-        x, y = int(prediction[0]), int(prediction[1])
+
+        # 🔥 ГАРАНТИРОВАННО РАБОТАЕТ НА ВСЕХ ВЕРСИЯХ OPENCV
+        x = int(prediction[0].item())
+        y = int(prediction[1].item())
+
         self.last_prediction = (x, y)
         self.missed += 1
         return self.last_prediction
+
 
 trackers = {}
 next_id = 0
 
 # ============== TCP VIDEO RECEIVER ==============
+
 def recv_exact(sock, size):
-    """Получить ровно size байт"""
-    buf = b""
-    while len(buf) < size:
-        data = sock.recv(size - len(buf))
-        if not data:
+    """Читает ровно size байт из TCP, либо возвращает None при разрыве."""
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
             return None
-        buf += data
-    return buf
+        data += chunk
+    return data
 
 def receive_video_tcp():
-    print(f"📡 TCP сервер слушает порт {TCP_PORT}...")
-
+    """Сервер, принимающий JPEG-кадры по TCP от Unity."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("0.0.0.0", TCP_PORT))
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", VIDEO_PORT))
     server.listen(1)
 
+    print(f"[VIDEO TCP] Ожидание подключения на порту {VIDEO_PORT}...")
     conn, addr = server.accept()
-    print(f"🎥 Unity подключился: {addr}")
+    print(f"[VIDEO TCP] Подключен клиент: {addr}")
 
-    while True:
-        # 1) читаем длину JPEG
-        length_bytes = recv_exact(conn, 4)
-        if not length_bytes:
-            break
+    try:
+        while True:
+            length_bytes = recv_exact(conn, 4)
+            if length_bytes is None:
+                break
 
-        frame_len = struct.unpack("<I", length_bytes)[0]
+            frame_len = struct.unpack("<I", length_bytes)[0]
+            if frame_len <= 0 or frame_len > 10_000_000:
+                print("[VIDEO TCP] Неверная длина кадра")
+                break
 
-        # 2) читаем JPEG
-        jpg_bytes = recv_exact(conn, frame_len)
-        if not jpg_bytes:
-            break
+            jpg_bytes = recv_exact(conn, frame_len)
+            if jpg_bytes is None:
+                break
 
-        # 3) декодируем
-        frame = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR)
-        if frame is None:
-            continue
+            jpg_np = np.frombuffer(jpg_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(jpg_np, cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
 
-        if not frame_queue.full():
-            frame_queue.put(frame)
+            if frame.shape[1] != W or frame.shape[0] != H:
+                frame = cv2.resize(frame, (W, H))
 
-    conn.close()
-    server.close()
-    print("🛑 TCP соединение закрыто")
+            if not frame_queue.full():
+                frame_queue.put(frame)
+
+    except Exception as e:
+        print(f"[VIDEO TCP ERROR] {e}")
+    finally:
+        conn.close()
+        server.close()
+        print("[VIDEO TCP] Сервер остановлен.")
 
 # ============== UDP LIDAR RECEIVER ==============
 def receive_lidar():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", LIDAR_PORT))
+    print(f"[LiDAR UDP] Слушаем порт {LIDAR_PORT}...")
 
     while True:
-        msg, _ = sock.recvfrom(1024)
-        parts = msg.decode().split(",")
+        try:
+            msg, _ = sock.recvfrom(1024)
+            line = msg.decode().strip()
+            if not line:
+                continue
 
-        if len(parts) < 2:
-            continue
+            parts = line.split(",")
+            if len(parts) != 2:
+                continue
 
-        angle = float(parts[0])
-        dist = float(parts[1])
+            angle = int(float(parts[0]))
+            dist = float(parts[1])
+            lidar_data[angle] = dist
 
-        lidar_data[int(angle)] = dist
+        except Exception as e:
+            print(f"[LiDAR ERROR] {e}")
 
 # ============== TRACKING LOGIC ==============
 def assign_detections(detections):
@@ -180,7 +203,7 @@ def draw(frame, results):
         cv2.putText(frame, f"ID {tid}", (px, py - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
 
-        if distance:
+        if distance is not None:
             cv2.putText(frame, f"{distance:.2f}m",
                         (px, py - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -192,6 +215,7 @@ def inference_loop():
 
     while True:
         if frame_queue.empty():
+            time.sleep(0.001)
             continue
 
         frame = frame_queue.get()
@@ -208,9 +232,10 @@ def inference_loop():
 
 # ============== START ==============
 if __name__ == "__main__":
-    print("🚀 YOLO + LiDAR + Kalman Tracking (TCP MODE)")
+    print("🚀 YOLO + LiDAR + Kalman Tracking (TCP VIDEO + UDP LiDAR)")
 
     threading.Thread(target=receive_video_tcp, daemon=True).start()
     threading.Thread(target=receive_lidar, daemon=True).start()
 
     inference_loop()
+    cv2.destroyAllWindows()
