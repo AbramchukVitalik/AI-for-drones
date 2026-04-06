@@ -67,11 +67,23 @@ def receive_video():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", VIDEO_PORT))
 
+    expected_size = W * H * 3  # ожидаемый размер кадра в байтах
+
     while True:
-        data, _ = sock.recvfrom(W * H * 3)
-        frame = np.frombuffer(data, dtype=np.uint8).reshape((H, W, 3))
-        if not frame_queue.full():
-            frame_queue.put(frame)
+        try:
+            data, _ = sock.recvfrom(expected_size)
+            
+            if len(data) != expected_size:
+                print(f"[VIDEO WARNING] received {len(data)} bytes, expected {expected_size}")
+                continue  # пропускаем неполный кадр
+
+            frame = np.frombuffer(data, dtype=np.uint8).reshape((H, W, 3))
+            
+            if not frame_queue.full():
+                frame_queue.put(frame)
+
+        except Exception as e:
+            print(f"[VIDEO ERROR] {e}")
 
 # ============== UDP LIDAR RECEIVER ==============
 def receive_lidar():
