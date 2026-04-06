@@ -79,9 +79,23 @@ def receive_lidar():
     sock.bind(("0.0.0.0", LIDAR_PORT))
 
     while True:
-        msg, _ = sock.recvfrom(1024)
-        angle, dist = msg.decode().split(",")
-        lidar_data[int(float(angle))] = float(dist)
+        try:
+            msg, _ = sock.recvfrom(1024)
+            line = msg.decode().strip()
+            if not line:
+                continue
+
+            parts = line.split(",")
+            if len(parts) != 2:
+                continue  # игнорируем неправильный пакет
+
+            angle_str, dist_str = parts
+            angle = int(float(angle_str))
+            dist = float(dist_str)
+            lidar_data[angle] = dist
+
+        except Exception as e:
+            print(f"[LiDAR ERROR] {e}")
 
 # ============== TRACKING LOGIC ==============
 def assign_detections(detections):
